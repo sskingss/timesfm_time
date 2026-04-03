@@ -1,84 +1,157 @@
 """
 全局配置模块
-包含模型参数、交易参数、回测参数、宏观分析参数等
-"""
+============
+配置加载优先级:
+  1. settings.toml（项目根目录，不提交到 git）
+  2. 代码内默认值（兜底）
 
-# ============ 模型配置 ============
-MODEL_CONFIG = {
-    "use_real_timesfm": True,        # 使用真实 TimesFM 模型（需 GPU + pip install timesfm）
+首次使用:
+  cp settings.example.toml settings.toml
+  # 编辑 settings.toml 填入你的参数
+"""
+from __future__ import annotations
+
+import os
+import tomllib
+from typing import Any
+
+# ── 定位配置文件 ──────────────────────────────────────────────
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "settings.toml")
+
+
+def _load_toml() -> dict[str, Any]:
+    if not os.path.exists(_SETTINGS_PATH):
+        return {}
+    try:
+        with open(_SETTINGS_PATH, "rb") as f:
+            data = tomllib.load(f)
+        print(f"[CONFIG] Loaded: {_SETTINGS_PATH}")
+        return data
+    except Exception as e:
+        print(f"[CONFIG] Failed to load {_SETTINGS_PATH}: {e}, using defaults")
+        return {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并，override 中的值覆盖 base，嵌套 dict 递归处理"""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+_TOML = _load_toml()
+
+
+def _section(key: str, defaults: dict) -> dict:
+    """从 TOML 中取 [key] 段并与 defaults 合并"""
+    return _deep_merge(defaults, _TOML.get(key, {}))
+
+
+# ── 默认值 + TOML 覆盖 ───────────────────────────────────────
+
+MODEL_CONFIG = _section("model", {
+    "use_real_timesfm": True,
     "hf_repo_id": "google/timesfm-2.5-200m-pytorch",
-    "context_length": 200,            # 历史窗口长度（原 512，缩短以减少滞后）
-    "horizon": 3,                     # 预测步长（原 10，短线更准）
+    "context_length": 200,
+    "horizon": 3,
     "max_context": 1024,
     "max_horizon": 128,
     "normalize_inputs": True,
     "use_continuous_quantile_head": True,
     "force_flip_invariance": True,
     "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
-}
+})
 
-# ============ 交易配置 ============
-TRADING_CONFIG = {
-    "initial_capital": 1_000_000,     # 初始资金 100 万
-    "commission_rate": 0.00075,       # A 股综合费率（佣金万2.5 + 印花税万5）
-    "slippage": 0.001,                # 滑点 0.1%（A 股散户优先级低）
-    "position_size": 0.7,             # 单次仓位 70%（原 30%，提高资金利用率）
-    "stop_loss": 0.08,                # 止损 8%（原 5%，给更多容错）
-    "take_profit": 0.20,              # 止盈 20%（原 10%，让利润充分奔跑）
-    "max_positions": 1,               # 最大同时持仓数
-}
+TRADING_CONFIG = _section("trading", {
+    "initial_capital": 1_000_000,
+    "commission_rate": 0.00075,
+    "slippage": 0.001,
+    "position_size": 0.7,
+    "stop_loss": 0.08,
+    "take_profit": 0.20,
+    "max_positions": 1,
+})
 
-# ============ 回测配置 ============
-BACKTEST_CONFIG = {
+BACKTEST_CONFIG = _section("backtest", {
     "start_date": "2022-01-01",
     "end_date": "2025-12-31",
-    "rebalance_freq": 2,              # 每 2 天重新预测一次（原 5，提高反应速度）
-    "warmup_period": 150,             # 预热期（原 512，释放更多交易日）
-}
+    "rebalance_freq": 2,
+    "warmup_period": 150,
+})
 
-# ============ 数据配置 ============
-# 股票代码格式：
-#   美股  — 字母代码，如 "AAPL", "TSLA"
-#   A 股  — 6 位数字代码，如 "600519"（茅台）, "000858"（五粮液）
-#            也可带交易所后缀 "600519.SH", "000858.SZ"
-DATA_CONFIG = {
-    "symbols": ["601766"],       # 默认美股；可改为 ["600519", "000858"] 回测 A 股
+DATA_CONFIG = _section("data", {
+    "symbols": ["601766"],
     "start_date": "2022-01-01",
     "end_date": "2025-12-31",
-}
+})
 
-# ============ 宏观分析配置 ============
-MACRO_CONFIG = {
-    "enabled": True,                   # 是否启用宏观因子
+MACRO_CONFIG = _section("macro", {
+    "enabled": True,
     "weights": {
-        "vix": 0.35,                   # VIX 恐慌指数权重
-        "yield": 0.30,                 # 国债收益率权重
-        "momentum": 0.35,             # 市场指数动量权重
+        "vix": 0.35,
+        "yield": 0.30,
+        "momentum": 0.35,
     },
     "us_indicators": {
-        "vix": "^VIX",                 # CBOE 波动率指数
-        "yield_10y": "^TNX",           # 美国 10 年期国债收益率
-        "market_index": "^GSPC",       # 标普 500
+        "vix": "^VIX",
+        "yield_10y": "^TNX",
+        "market_index": "^GSPC",
     },
     "cn_indicators": {
-        "market_index_ak": "sh000001", # 上证综指（akshare 格式）
-        "market_index_yf": "000001.SS",# 上证综指（yfinance 格式）
+        "market_index_ak": "sh000001",
+        "market_index_yf": "000001.SS",
     },
-}
+})
 
-# ============ 策略配置 ============
-STRATEGY_CONFIG = {
-    "trend_threshold": 0.005,         # 趋势策略门槛（原 0.01，更灵敏）
-    "quantile_risk_threshold": 0.05,  # 分位数策略风险阈值（原 0.03，适度放宽）
-    "ensemble_horizons": [2, 3, 5],   # 集成策略窗口（原 [3,5,10]，更短线）
+STRATEGY_CONFIG = _section("strategy", {
+    "trend_threshold": 0.005,
+    "quantile_risk_threshold": 0.05,
+    "ensemble_horizons": [2, 3, 5],
     "ensemble_weights": [0.3, 0.4, 0.3],
-    "macro_influence": 0.15,          # 宏观调节幅度（原 0.3，降低宏观干扰）
+    "macro_influence": 0.15,
+})
+
+# ── 插件配置（含敏感信息，务必只写在 settings.toml 中）────────
+
+_plugins_raw = _TOML.get("plugins", {})
+PLUGIN_CONFIG = {
+    "console": _deep_merge(
+        {"enabled": True, "verbose": False},
+        _plugins_raw.get("console", {}),
+    ),
+    "feishu": _deep_merge(
+        {
+            "enabled": False,
+            "webhook_url": "",
+            "secret": "",
+            "app_id": "",
+            "app_secret": "",
+            "receive_id": "",
+            "receive_id_type": "email",
+            "use_card": True,
+        },
+        _plugins_raw.get("feishu", {}),
+    ),
 }
 
-# ============ 可视化配置 ============
-VIS_CONFIG = {
+SIGNAL_CONFIG = _section("signal", {
+    "actionable_only": False,
+    "min_strength": 0.0,
+})
+
+_vis_raw = _section("visualization", {
     "output_dir": "output",
-    "figsize": (14, 7),
+    "figsize": [14, 7],
     "dpi": 120,
     "style": "seaborn-v0_8-whitegrid",
+})
+VIS_CONFIG = {
+    **_vis_raw,
+    "figsize": tuple(_vis_raw["figsize"]),  # TOML 数组 → Python 元组
 }

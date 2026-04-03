@@ -14,3 +14,6 @@ dependencies = [
     "torch>=2.11.0",
     "yfinance>=0.2.31",
 ]
+
+[project.optional-dependencies]
+feishu-sdk = ["lark-oapi>=1.4.0"]

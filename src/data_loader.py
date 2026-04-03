@@ -134,7 +134,8 @@ def download_cn_data(symbol: str, start_date: str, end_date: str) -> dict:
                 time.sleep(_RETRY_DELAY * attempt)
 
     if df is None or df.empty:
-        raise ValueError(f"akshare 未返回 {symbol}({code}) 在 {start_date}~{end_date} 的数据")
+        print(f"[DATA] akshare failed for {symbol}, falling back to yfinance...")
+        return _download_cn_via_yfinance(symbol, code, start_date, end_date)
 
     df = df.dropna(subset=["收盘"])
 
@@ -149,6 +150,38 @@ def download_cn_data(symbol: str, start_date: str, end_date: str) -> dict:
         "low": df["最低"].values.astype(float),
         "close": df["收盘"].values.astype(float),
         "volume": df["成交量"].values.astype(float),
+    }
+
+
+def _download_cn_via_yfinance(symbol: str, code: str, start_date: str, end_date: str) -> dict:
+    """akshare 不可用时，通过 yfinance 拉取 A 股数据（上交所 .SS / 深交所 .SZ）"""
+    import yfinance as yf
+
+    suffix = ".SS" if code.startswith(("6", "5", "9")) else ".SZ"
+    yf_symbol = f"{code}{suffix}"
+
+    print(f"[DATA] yfinance fallback: {yf_symbol} ({start_date} ~ {end_date})")
+    df = yf.download(yf_symbol, start=start_date, end=end_date, progress=False)
+
+    if df.empty:
+        raise ValueError(f"yfinance 也未返回 {symbol} ({yf_symbol}) 的数据，请检查网络")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+
+    df = df.dropna(subset=["Close"])
+
+    return {
+        "symbol": symbol,
+        "market": "CN",
+        "currency": "CNY",
+        "dates": np.arange(len(df)),
+        "date_strs": df.index.strftime("%Y-%m-%d").tolist(),
+        "open": df["Open"].values.astype(float),
+        "high": df["High"].values.astype(float),
+        "low": df["Low"].values.astype(float),
+        "close": df["Close"].values.astype(float),
+        "volume": df["Volume"].values.astype(float),
     }
 
 

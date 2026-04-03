@@ -31,6 +31,8 @@ cache/
 .env
 .env.*
 !.env.example
+settings.toml
+!settings.example.toml
 
 # ============ uv / pip ============
 .python-version
@@ -46,6 +48,7 @@ cache/
 # ============ Logs ============
 logs/
 *.log
+test_feishu.py
 
 # ============ OS ============
 Thumbs.db

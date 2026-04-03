@@ -1,0 +1,107 @@
+# ================================================================
+# TimesFM 量化交易系统 — 配置文件模板
+# ================================================================
+# 使用方法:
+#   1. 复制本文件:  cp settings.example.toml settings.toml
+#   2. 编辑 settings.toml，填入你的参数
+#   3. settings.toml 已被 .gitignore 排除，不会提交到仓库
+#
+# 所有参数都有代码内默认值，只需覆盖你想修改的部分即可。
+# ================================================================
+
+# ── 模型配置 ──────────────────────────────────────────────────
+[model]
+use_real_timesfm = true
+hf_repo_id = "google/timesfm-2.5-200m-pytorch"
+context_length = 200                # 历史窗口长度
+horizon = 3                         # 预测步长
+max_context = 1024
+max_horizon = 128
+normalize_inputs = true
+use_continuous_quantile_head = true
+force_flip_invariance = true
+quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+# ── 交易配置 ──────────────────────────────────────────────────
+[trading]
+initial_capital = 1_000_000         # 初始资金
+commission_rate = 0.00075           # A 股综合费率
+slippage = 0.001                    # 滑点
+position_size = 0.7                 # 单次仓位比例
+stop_loss = 0.08                    # 止损
+take_profit = 0.20                  # 止盈
+max_positions = 1
+
+# ── 回测配置 ──────────────────────────────────────────────────
+[backtest]
+start_date = "2022-01-01"
+end_date = "2025-12-31"
+rebalance_freq = 2                  # 重新预测间隔（交易日）
+warmup_period = 150                 # 预热期
+
+# ── 数据配置 ──────────────────────────────────────────────────
+# 股票代码格式:
+#   美股: "AAPL", "TSLA"
+#   A 股: "601766", "600519", "000858"
+[data]
+symbols = ["601766"]
+start_date = "2022-01-01"
+end_date = "2025-12-31"
+
+# ── 宏观分析配置 ──────────────────────────────────────────────
+[macro]
+enabled = true
+
+[macro.weights]
+vix = 0.35
+yield = 0.30
+momentum = 0.35
+
+[macro.us_indicators]
+vix = "^VIX"
+yield_10y = "^TNX"
+market_index = "^GSPC"
+
+[macro.cn_indicators]
+market_index_ak = "sh000001"
+market_index_yf = "000001.SS"
+
+# ── 策略配置 ──────────────────────────────────────────────────
+[strategy]
+trend_threshold = 0.005             # 趋势策略门槛
+quantile_risk_threshold = 0.05      # 分位数风控阈值
+ensemble_horizons = [2, 3, 5]       # 集成策略窗口
+ensemble_weights = [0.3, 0.4, 0.3]
+macro_influence = 0.15              # 宏观因子调节幅度
+
+# ── 插件配置 ──────────────────────────────────────────────────
+[plugins.console]
+enabled = true
+verbose = true                      # 打印预测值和关键特征
+
+# 飞书通知
+# 方式一 (推荐): Webhook
+#   群聊 → 设置 → 群机器人 → 自定义机器人 → 复制 webhook 地址
+# 方式二: SDK (需 pip install lark-oapi)
+#   飞书开放平台创建应用 → 获取 app_id / app_secret
+[plugins.feishu]
+enabled = false                     # ← 配好凭据后改为 true
+webhook_url = ""                    # Webhook 模式: https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+secret = ""                         # Webhook 签名校验密钥（可选）
+app_id = ""                         # SDK 模式: 应用 App ID
+app_secret = ""                     # SDK 模式: 应用 App Secret
+receive_id = ""                     # 接收方 (邮箱/open_id/user_id/chat_id)
+receive_id_type = "email"           # 接收方类型: email / open_id / user_id / chat_id
+use_card = true                     # true=卡片消息 false=纯文本
+
+# ── 信号配置 ──────────────────────────────────────────────────
+[signal]
+actionable_only = false             # true 时只分发 BUY/SELL
+min_strength = 0.0                  # 信号强度过滤门槛
+
+# ── 可视化配置 ────────────────────────────────────────────────
+[visualization]
+output_dir = "output"
+figsize = [14, 7]
+dpi = 120
+style = "seaborn-v0_8-whitegrid"
