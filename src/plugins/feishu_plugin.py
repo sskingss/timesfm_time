@@ -18,7 +18,7 @@
      · "chat_id" → 群聊 ID
 
 消息格式：
-  - use_card=True  → 发送交互式卡片消息（美观，推荐）
+  - use_card=True  → 发送交互式卡片消息（按标的聚合，推荐）
   - use_card=False → 发送纯文本消息
 """
 from __future__ import annotations
@@ -38,6 +38,36 @@ from .base import BasePlugin, SignalEvent
 _SIGNAL_EMOJI = {1: "📈", -1: "📉", 0: "⏸️"}
 _SIGNAL_COLOR = {1: "green", -1: "red", 0: "grey"}
 _SIGNAL_CN = {1: "买入", -1: "卖出", 0: "观望"}
+
+_KEY_FEATURES = ("rsi", "adx", "volume_ratio", "macro_score", "volatility")
+
+
+def _pick_header_color(events: list[SignalEvent]) -> str:
+    """根据一组信号的综合方向决定卡片头颜色。"""
+    has_buy = any(e.signal == 1 for e in events)
+    has_sell = any(e.signal == -1 for e in events)
+    if has_buy and not has_sell:
+        return "green"
+    if has_sell and not has_buy:
+        return "red"
+    if has_buy and has_sell:
+        return "orange"
+    return "grey"
+
+
+def _pick_header_summary(events: list[SignalEvent]) -> str:
+    """生成卡片标题中的方向摘要文字。"""
+    buy = sum(1 for e in events if e.signal == 1)
+    sell = sum(1 for e in events if e.signal == -1)
+    hold = sum(1 for e in events if e.signal == 0)
+    parts = []
+    if buy:
+        parts.append(f"{buy}买入")
+    if sell:
+        parts.append(f"{sell}卖出")
+    if hold:
+        parts.append(f"{hold}观望")
+    return " / ".join(parts)
 
 
 class FeishuPlugin(BasePlugin):
@@ -77,11 +107,19 @@ class FeishuPlugin(BasePlugin):
     # ── main entry ────────────────────────────────────────────
 
     def handle(self, event: SignalEvent) -> None:
-        if self._use_card:
-            payload = self._build_card_message(event)
-        else:
-            payload = self._build_text_message(event)
+        self.handle_batch(event.symbol, [event])
 
+    def handle_batch(self, symbol: str, events: list[SignalEvent]) -> None:
+        if self._use_card:
+            payload = self._build_batch_card(symbol, events)
+        else:
+            payload = self._build_batch_text(symbol, events)
+
+        self._send(payload)
+
+    # ── senders ───────────────────────────────────────────────
+
+    def _send(self, payload: dict) -> None:
         if self._webhook_url:
             self._send_webhook(payload)
         elif self._sdk_client and self._receive_id:
@@ -89,85 +127,100 @@ class FeishuPlugin(BasePlugin):
         else:
             print(f"  [Feishu] ⚠ No webhook_url or SDK receive_id configured, skipping")
 
-    # ── message builders ──────────────────────────────────────
+    # ── batch message builders (per symbol) ───────────────────
 
-    def _build_text_message(self, event: SignalEvent) -> dict[str, Any]:
-        emoji = _SIGNAL_EMOJI.get(event.signal, "❓")
-        cn = _SIGNAL_CN.get(event.signal, "未知")
+    def _build_batch_text(self, symbol: str, events: list[SignalEvent]) -> dict[str, Any]:
+        """纯文本模式：一个标的一条消息，内含所有策略结果。"""
+        ref = events[0]
+        summary = _pick_header_summary(events)
 
         lines = [
-            f"{emoji} 【交易信号】{cn}",
-            f"━━━━━━━━━━━━━━━━━━",
-            f"标的: {event.symbol}",
-            f"策略: {event.strategy}",
-            f"方向: {event.signal_label} ({cn})",
-            f"强度: {event.strength:.0%}",
-            f"现价: {event.current_price:.2f}",
-            f"原因: {event.reason}",
-            f"时间: {event.timestamp:%Y-%m-%d %H:%M}",
+            f"📊 【信号汇总】{symbol}",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"现价: ¥{ref.current_price:.2f}  |  时间: {ref.timestamp:%Y-%m-%d %H:%M}",
+            f"方向汇总: {summary}",
+            "",
         ]
 
-        if event.point_forecast:
-            fc = ", ".join(f"{v:.2f}" for v in event.point_forecast[:5])
-            lines.append(f"预测: [{fc}]")
+        for i, event in enumerate(events, 1):
+            emoji = _SIGNAL_EMOJI.get(event.signal, "❓")
+            cn = _SIGNAL_CN.get(event.signal, "未知")
+            lines.append(f"{'─' * 20}")
+            lines.append(f"{emoji} 策略 {i}: {event.strategy}")
+            lines.append(f"  方向: {event.signal_label} ({cn})  |  强度: {event.strength:.0%}")
+            lines.append(f"  原因: {event.reason}")
 
-        key_feats = {k: v for k, v in event.features.items()
-                     if k in ("rsi", "adx", "volume_ratio", "macro_score", "volatility")}
+        if ref.point_forecast:
+            fc = " → ".join(f"{v:.2f}" for v in ref.point_forecast[:5])
+            lines.extend(["", f"预测路径: {fc}"])
+
+        key_feats = {k: v for k, v in ref.features.items() if k in _KEY_FEATURES}
         if key_feats:
             feats_str = " | ".join(f"{k}={v:.2f}" for k, v in key_feats.items())
-            lines.append(f"指标: {feats_str}")
+            lines.append(f"关键指标: {feats_str}")
 
         return {
             "msg_type": "text",
             "content": {"text": "\n".join(lines)},
         }
 
-    def _build_card_message(self, event: SignalEvent) -> dict[str, Any]:
-        emoji = _SIGNAL_EMOJI.get(event.signal, "❓")
-        cn = _SIGNAL_CN.get(event.signal, "未知")
-        color = _SIGNAL_COLOR.get(event.signal, "grey")
-
-        header_template = {"blue": "blue", "green": "green", "red": "red", "grey": "grey"}
-        template = header_template.get(color, "blue")
+    def _build_batch_card(self, symbol: str, events: list[SignalEvent]) -> dict[str, Any]:
+        """卡片模式：一个标的一张卡片，每个策略一个独立区块。"""
+        ref = events[0]
+        color = _pick_header_color(events)
+        summary = _pick_header_summary(events)
 
         elements: list[dict] = []
 
+        # ── 标的概览 ──
         elements.append({
             "tag": "div",
             "fields": [
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**标的**\n{event.symbol}"}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**策略**\n{event.strategy}"}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**方向**\n{emoji} {cn}"}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**强度**\n{event.strength:.0%}"}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**现价**\n¥{event.current_price:.2f}"}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{event.timestamp:%m-%d %H:%M}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**标的**\n{symbol}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**现价**\n¥{ref.current_price:.2f}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**时间**\n{ref.timestamp:%m-%d %H:%M}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**方向汇总**\n{summary}"}},
             ],
         })
 
-        elements.append({"tag": "hr"})
-
-        elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**信号原因**\n{event.reason}"},
-        })
-
-        if event.point_forecast:
-            fc_items = " → ".join(f"{v:.2f}" for v in event.point_forecast[:5])
+        # ── 预测路径（共享同一个模型输出） ──
+        if ref.point_forecast:
+            fc_items = " → ".join(f"{v:.2f}" for v in ref.point_forecast[:5])
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**预测路径**\n{fc_items}"},
+                "text": {"tag": "lark_md", "content": f"**预测路径**  {fc_items}"},
             })
 
-        key_feats = {k: v for k, v in event.features.items()
-                     if k in ("rsi", "adx", "volume_ratio", "macro_score", "volatility")}
+        # ── 关键指标（同一标的共享） ──
+        key_feats = {k: v for k, v in ref.features.items() if k in _KEY_FEATURES}
         if key_feats:
             feat_parts = [f"`{k}={v:.2f}`" for k, v in key_feats.items()]
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**关键指标**\n{' | '.join(feat_parts)}"},
+                "text": {"tag": "lark_md", "content": f"**关键指标**  {' | '.join(feat_parts)}"},
             })
 
         elements.append({"tag": "hr"})
+
+        # ── 每个策略一个区块 ──
+        for event in events:
+            emoji = _SIGNAL_EMOJI.get(event.signal, "❓")
+            cn = _SIGNAL_CN.get(event.signal, "未知")
+
+            elements.append({
+                "tag": "div",
+                "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**{event.strategy}**\n{emoji} {cn}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**强度**\n{event.strength:.0%}"}},
+                ],
+            })
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"{event.reason}"},
+            })
+            elements.append({"tag": "hr"})
+
+        # ── 底部 disclaimer ──
         elements.append({
             "tag": "note",
             "elements": [{"tag": "plain_text", "content": "TimesFM Quant Signal System · 仅供参考，不构成投资建议"}],
@@ -175,8 +228,8 @@ class FeishuPlugin(BasePlugin):
 
         card = {
             "header": {
-                "title": {"tag": "plain_text", "content": f"{emoji} 交易信号 — {event.symbol} {cn}"},
-                "template": template,
+                "title": {"tag": "plain_text", "content": f"📊 信号汇总 — {symbol} ({summary})"},
+                "template": color,
             },
             "elements": elements,
         }

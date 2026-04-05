@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from .plugins.base import BasePlugin, SignalEvent
 
 
@@ -51,6 +53,22 @@ class SignalDispatcher:
                     p.on_error(event, e)
                 except Exception:
                     print(f"  [Dispatcher] Plugin '{p.name}' on_error also failed")
+
+    def dispatch_batch(self, events: list[SignalEvent]) -> None:
+        """按标的分组后调用插件的 handle_batch，一个标的一条消息。"""
+        grouped: OrderedDict[str, list[SignalEvent]] = OrderedDict()
+        for e in events:
+            grouped.setdefault(e.symbol, []).append(e)
+
+        for symbol, symbol_events in grouped.items():
+            for p in self._plugins:
+                try:
+                    p.handle_batch(symbol, symbol_events)
+                except Exception as e:
+                    try:
+                        p.on_error(symbol_events[0], e)
+                    except Exception:
+                        print(f"  [Dispatcher] Plugin '{p.name}' on_error also failed")
 
     @property
     def plugin_names(self) -> list[str]:

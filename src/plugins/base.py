@@ -80,6 +80,13 @@ class BasePlugin(abc.ABC):
     def handle(self, event: SignalEvent) -> None:
         ...
 
+    def handle_batch(self, symbol: str, events: list[SignalEvent]) -> None:
+        """处理同一标的下的一批信号（默认逐条调用 handle）。
+        子类可覆写此方法实现按标的聚合的消息格式。
+        """
+        for event in events:
+            self.handle(event)
+
     def on_error(self, event: SignalEvent, error: Exception) -> None:
         print(f"  [PLUGIN:{self.name}] Error: {error}")
 

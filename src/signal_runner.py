@@ -207,11 +207,12 @@ def run(
 
     actionable = [e for e in events if e.is_actionable]
     hold = [e for e in events if not e.is_actionable]
-    print(f"\n[SCAN] {len(events)} signal(s): {len(actionable)} actionable, {len(hold)} hold")
-    print(f"[SCAN] Dispatching...\n")
+    symbols_count = len({e.symbol for e in events})
+    print(f"\n[SCAN] {len(events)} signal(s) across {symbols_count} symbol(s): "
+          f"{len(actionable)} actionable, {len(hold)} hold")
+    print(f"[SCAN] Dispatching (grouped by symbol)...\n")
 
-    for event in events:
-        dispatcher.dispatch(event)
+    dispatcher.dispatch_batch(events)
 
     dispatcher.shutdown()
 
