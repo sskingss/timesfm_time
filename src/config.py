@@ -140,6 +140,13 @@ PLUGIN_CONFIG = {
     ),
 }
 
+REPORT_CONFIG = _section("report", {
+    "use_timesfm_screening": True,
+    "stage1_pool_size": 50,
+    "stage2_weight": 0.6,
+    "stage1_weight": 0.4,
+})
+
 SIGNAL_CONFIG = _section("signal", {
     "actionable_only": False,
     "min_strength": 0.0,

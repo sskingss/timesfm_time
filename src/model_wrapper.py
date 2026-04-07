@@ -141,6 +141,27 @@ class TimesFMPredictor:
         )
         return point_forecast[0], quantile_forecast[0]
 
+    def predict_batch(self, histories, horizon):
+        """
+        批量预测: 一次前向传播处理多条序列。
+
+        Args:
+            histories: list[np.ndarray], 每条为 shape (T,) 的收盘价序列
+            horizon: int, 预测步长
+
+        Returns:
+            point_forecasts: list[np.ndarray], 每条 shape (horizon,)
+            quantile_forecasts: list[np.ndarray], 每条 shape (horizon, 10)
+        """
+        point_forecasts, quantile_forecasts = self.model.forecast(
+            horizon=horizon,
+            inputs=histories,
+        )
+        return (
+            [point_forecasts[i] for i in range(len(histories))],
+            [quantile_forecasts[i] for i in range(len(histories))],
+        )
+
 
 class SimulatedPredictor:
     """
@@ -233,6 +254,15 @@ class SimulatedPredictor:
                 quantile_forecast[t, qi + 1] = point_forecast[t] * np.exp(z * t_vol)
 
         return point_forecast, quantile_forecast
+
+    def predict_batch(self, histories, horizon):
+        """批量模拟预测, 逐条调用 predict()"""
+        points, quantiles = [], []
+        for h in histories:
+            p, q = self.predict(h, horizon)
+            points.append(p)
+            quantiles.append(q)
+        return points, quantiles
 
 
 def _norm_ppf(q):

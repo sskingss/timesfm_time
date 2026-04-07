@@ -1,12 +1,12 @@
 """
 A股短线市场风格分析与选股报告
 ==============================
-市场风格趋势分析 → 整体资金流向 → 板块热点预测 → 个股筛选 → 推送报告
+数据源: 腾讯实时行情 · 新浪行业分类 · AKShare 指数
 
 分析维度:
   1. 大盘概览: 涨跌分布、量能、情绪温度
   2. 风格轮动: 大盘/小盘、成长/价值强弱对比
-  3. 板块热点: 行业+概念板块资金流入排名
+  3. 板块热点: 行业板块涨幅 & 量能排名
   4. 个股精选: 多因子评分模型筛选上涨概率最大的标的
 
 用法:
@@ -22,6 +22,7 @@ import hmac
 import base64
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -30,6 +31,7 @@ import urllib.error
 
 import numpy as np
 import pandas as pd
+import requests as _requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import config
@@ -69,69 +71,224 @@ _OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
 )
 
+_TENCENT_API = "http://qt.gtimg.cn/q="
+_SINA_SECTOR_API = "https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
+_EM_DATACENTER_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+
+_BATCH_SIZE = 800
+_BATCH_DELAY = 0.15
+
+_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "report"
+)
+
 
 # ================================================================
-# 1. Data Fetching (akshare)
+# 1. Data Fetching — Tencent Real-Time Quotes
 # ================================================================
 
-def _retry(fn, *args, retries: int = 2, delay: float = 2.0, label: str = "", **kwargs):
-    """带重试的 API 调用包装"""
-    for attempt in range(retries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            tag = label or fn.__name__
-            if attempt < retries - 1:
-                print(f"  [FETCH] {tag} attempt {attempt + 1} failed: {e}, retrying...")
-                time.sleep(delay * (attempt + 1))
-            else:
-                print(f"  [FETCH] {tag} failed after {retries} attempts: {e}")
-    return None
+def _safe_float(s: str) -> float:
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
 
 
-def _fetch_all_stocks() -> pd.DataFrame | None:
-    """全A股实时行情快照 (东方财富)"""
-    import akshare as ak
-    df = _retry(ak.stock_zh_a_spot_em, label="全A行情")
-    if df is None or df.empty:
+def _generate_all_codes() -> list[str]:
+    """生成全部 A 股代码 (上海 + 深圳), 返回腾讯 API 格式"""
+    codes: list[str] = []
+    for start, end in [(600000, 602000), (603000, 604000), (605000, 606000)]:
+        codes += [f"sh{i}" for i in range(start, end)]
+    codes += [f"sh{i}" for i in range(688000, 690000)]
+    codes += [f"sz{i:06d}" for i in range(1, 4500)]
+    codes += [f"sz{i}" for i in range(300000, 302000)]
+    return codes
+
+
+def _parse_tencent_line(line: str) -> dict | None:
+    """解析腾讯行情 API 返回的单行数据"""
+    if "~" not in line or '=""' in line:
         return None
-    for col in ["最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "振幅",
-                "最高", "最低", "今开", "昨收", "量比", "换手率",
-                "市盈率-动态", "市净率", "总市值", "流通市值",
-                "60日涨跌幅", "年初至今涨跌幅"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    try:
+        raw = line.split('"')[1]
+    except IndexError:
+        return None
+    parts = raw.split("~")
+    if len(parts) < 50:
+        return None
+
+    price = _safe_float(parts[3])
+    if price <= 0:
+        return None
+
+    row = {
+        "代码": parts[2],
+        "名称": re.sub(r"\s+", "", parts[1]),
+        "最新价": price,
+        "昨收": _safe_float(parts[4]),
+        "今开": _safe_float(parts[5]),
+        "成交量": _safe_float(parts[6]) * 100,
+        "成交额": _safe_float(parts[37]) * 1e4,
+        "涨跌额": _safe_float(parts[31]),
+        "涨跌幅": _safe_float(parts[32]),
+        "最高": _safe_float(parts[33]),
+        "最低": _safe_float(parts[34]),
+        "换手率": _safe_float(parts[38]),
+        "量比": _safe_float(parts[49]),
+        "振幅": _safe_float(parts[43]),
+        "市盈率-动态": _safe_float(parts[39]),
+        "市净率": _safe_float(parts[46]),
+        "流通市值": _safe_float(parts[44]) * 1e8,
+        "总市值": _safe_float(parts[45]) * 1e8,
+        "外盘": _safe_float(parts[7]),
+        "内盘": _safe_float(parts[8]),
+    }
+    if len(parts) > 66:
+        row["60日涨跌幅"] = _safe_float(parts[65])
+        row["年初至今涨跌幅"] = _safe_float(parts[66])
+    return row
 
 
-def _fetch_sector_flow(sector_type: str = "行业资金流") -> pd.DataFrame | None:
-    """板块资金流排名"""
-    import akshare as ak
-    df = _retry(
-        ak.stock_sector_fund_flow_rank,
-        indicator="今日", sector_type=sector_type,
-        label=f"板块资金流({sector_type})",
-    )
-    if df is not None and not df.empty:
-        for col in df.columns:
-            if col not in ("序号", "名称"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+def _fetch_tencent_quotes(codes: list[str]) -> pd.DataFrame:
+    """通过腾讯 qt.gtimg.cn 批量拉取全 A 实时行情"""
+    session = _requests.Session()
+    rows: list[dict] = []
+    total_batches = (len(codes) + _BATCH_SIZE - 1) // _BATCH_SIZE
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * _BATCH_SIZE
+        batch = codes[start : start + _BATCH_SIZE]
+        url = _TENCENT_API + ",".join(batch)
+
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = session.get(url, timeout=15)
+                break
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(1.0 * (attempt + 1))
+                else:
+                    print(f"  [FETCH] batch {batch_idx + 1}/{total_batches} failed: {exc}")
+
+        if resp is None:
+            continue
+
+        for line in resp.text.split(";"):
+            parsed = _parse_tencent_line(line)
+            if parsed:
+                rows.append(parsed)
+
+        if batch_idx < total_batches - 1:
+            time.sleep(_BATCH_DELAY)
+
+        if (batch_idx + 1) % 5 == 0 or batch_idx + 1 == total_batches:
+            print(
+                f"  [FETCH] {batch_idx + 1}/{total_batches} batches "
+                f"({len(rows)} stocks)"
+            )
+
+    session.close()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
-def _fetch_stock_fund_flow() -> pd.DataFrame | None:
-    """个股资金流排名"""
-    import akshare as ak
-    df = _retry(ak.stock_individual_fund_flow_rank, indicator="今日", label="个股资金流")
-    if df is not None and not df.empty:
-        for col in df.columns:
-            if col not in ("序号", "代码", "名称"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+# ================================================================
+# 2. Data Fetching — Industry Classification
+# ================================================================
 
+def _fetch_industry_mapping() -> dict[str, str]:
+    """从东方财富 datacenter 获取全 A 股行业分类映射 (代码→行业名)
+
+    数据源: 申万行业分类, 覆盖 ~5500 只 A 股.
+    结果按日缓存到 cache/report/ 下.
+    """
+    import pickle
+
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    today = dt.date.today().isoformat()
+    cache_path = os.path.join(_CACHE_DIR, f"industry_map_{today}.pkl")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+        print(f"  [FETCH] Industry mapping loaded from cache ({len(cached)} codes)")
+        return cached
+
+    code_to_industry: dict[str, str] = {}
+    for page in range(1, 6):
+        params = {
+            "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+            "columns": "SECURITY_CODE,BOARD_NAME",
+            "pageSize": "6000",
+            "pageNumber": str(page),
+            "sortTypes": "1",
+            "sortColumns": "SECURITY_CODE",
+            "filter": '(BOARD_TYPE="行业")',
+        }
+        try:
+            resp = _requests.get(_EM_DATACENTER_API, params=params, timeout=30)
+            result = resp.json().get("result")
+            if result is None:
+                break
+            data = result.get("data", [])
+            if not data:
+                break
+            for item in data:
+                code = item.get("SECURITY_CODE", "")
+                industry = item.get("BOARD_NAME", "")
+                if code and industry:
+                    code_to_industry[code] = industry
+        except Exception as exc:
+            print(f"  [FETCH] East Money industry page {page} failed: {exc}")
+            break
+
+    if code_to_industry:
+        with open(cache_path, "wb") as f:
+            pickle.dump(code_to_industry, f)
+
+    return code_to_industry
+
+
+def _fetch_sina_sector_summary() -> list[dict]:
+    """从新浪获取行业板块行情摘要 (49 个粗行业的涨跌幅)"""
+    try:
+        resp = _requests.get(
+            _SINA_SECTOR_API,
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=10,
+        )
+        text = resp.text.strip()
+        if not text.startswith("var"):
+            return []
+
+        payload = text.split("=", 1)[1].strip().rstrip(";")
+        data: dict = json.loads(payload.replace("'", '"'))
+
+        sector_list: list[dict] = []
+        for _key, info_str in data.items():
+            parts = info_str.split(",")
+            if len(parts) < 6:
+                continue
+            sector_list.append({
+                "name": parts[1],
+                "change_pct": round(_safe_float(parts[5]), 2),
+                "count": int(parts[2]) if parts[2].isdigit() else 0,
+            })
+
+        sector_list.sort(key=lambda x: x["change_pct"], reverse=True)
+        return sector_list
+
+    except Exception as exc:
+        print(f"  [FETCH] Sina sector summary failed: {exc}")
+        return []
+
+
+# ================================================================
+# 3. Data Fetching — AKShare Index
+# ================================================================
 
 def _fetch_index_daily(symbol: str, name: str) -> dict | None:
-    """获取指数最新收盘数据"""
     import akshare as ak
     try:
         df = ak.stock_zh_index_daily_em(symbol=symbol)
@@ -153,7 +310,6 @@ def _fetch_index_daily(symbol: str, name: str) -> dict | None:
 
 
 def _fetch_major_indices() -> list[dict]:
-    """获取主要指数行情"""
     targets = [
         ("sh000001", "上证指数"), ("sz399001", "深证成指"),
         ("sz399006", "创业板指"), ("sh000016", "上证50"),
@@ -169,11 +325,10 @@ def _fetch_major_indices() -> list[dict]:
 
 
 # ================================================================
-# 2. Market Overview Analysis
+# 4. Market Overview Analysis
 # ================================================================
 
 def _analyze_overview(stocks: pd.DataFrame) -> dict:
-    """从全A快照中分析大盘概览"""
     total = len(stocks)
     valid = stocks.dropna(subset=["涨跌幅"])
 
@@ -185,7 +340,6 @@ def _analyze_overview(stocks: pd.DataFrame) -> dict:
     code_col = valid["代码"].astype(str)
     pct = valid["涨跌幅"]
 
-    is_main = code_col.str.startswith(("6", "0"))
     is_gem = code_col.str.startswith("3")
     is_star = code_col.str.startswith("68")
     is_st = valid["名称"].str.contains("ST", na=False)
@@ -229,11 +383,10 @@ def _analyze_overview(stocks: pd.DataFrame) -> dict:
 
 
 # ================================================================
-# 3. Market Style Analysis
+# 5. Market Style Analysis
 # ================================================================
 
 def _analyze_style(stocks: pd.DataFrame) -> dict:
-    """分析大小盘、成长价值风格强弱"""
     valid = stocks.dropna(subset=["涨跌幅", "总市值"]).copy()
     valid = valid[valid["总市值"] > 0]
 
@@ -276,7 +429,7 @@ def _analyze_style(stocks: pd.DataFrame) -> dict:
         "小盘(<100亿)": (int(small.sum()), small_chg),
     }
 
-    momentum_desc = []
+    momentum_desc: list[str] = []
     if abs(size_diff) > 1.0:
         leader = "小盘股" if size_diff > 0 else "大盘股"
         momentum_desc.append(f"{leader}显著领涨, 大小盘分化 {abs(size_diff):.1f}%")
@@ -298,69 +451,78 @@ def _analyze_style(stocks: pd.DataFrame) -> dict:
 
 
 # ================================================================
-# 4. Sector Hotspot Analysis
+# 6. Sector Hotspot Analysis
 # ================================================================
 
 def _analyze_sectors(
-    industry_flow: pd.DataFrame | None,
-    concept_flow: pd.DataFrame | None,
+    stocks: pd.DataFrame,
+    sector_map: dict[str, str],
+    sina_sectors: list[dict],
 ) -> dict:
-    """分析行业和概念板块热点"""
+    """从全量快照 + 行业分类映射分析板块热点"""
+    valid = stocks.dropna(subset=["涨跌幅"]).copy()
+    valid["行业"] = valid["代码"].map(sector_map).fillna("未分类")
 
-    def _extract_top(df: pd.DataFrame | None, n: int = 8) -> list[dict]:
-        if df is None or df.empty:
-            return []
-        name_col = "名称" if "名称" in df.columns else df.columns[1]
-        change_col = next((c for c in df.columns if "涨跌幅" in c), None)
-        flow_col = next((c for c in df.columns if "主力净流入" in c and "净额" in c), None)
+    classified = valid[valid["行业"] != "未分类"]
+    if classified.empty:
+        top8 = sina_sectors[:8]
+        return {
+            "hot_industries": [
+                {"name": s["name"], "change_pct": s["change_pct"]} for s in top8
+            ],
+            "hot_concepts": [],
+            "inflow_industries": [],
+            "inflow_concepts": [],
+        }
 
-        if not change_col:
-            return []
+    grouped = classified.groupby("行业")
+    stats = grouped.agg(
+        count=("代码", "count"),
+        avg_change=("涨跌幅", "mean"),
+        total_amount=("成交额", "sum"),
+        avg_turnover=("换手率", "mean"),
+        up_count=("涨跌幅", lambda x: (x > 0).sum()),
+        net_buy=("外盘", "sum"),
+        net_sell=("内盘", "sum"),
+    ).reset_index()
 
-        sorted_df = df.sort_values(change_col, ascending=False).head(n)
-        results = []
-        for _, row in sorted_df.iterrows():
-            item = {
-                "name": str(row.get(name_col, "")),
-                "change_pct": round(float(row.get(change_col, 0)), 2),
-            }
-            if flow_col:
-                raw = row.get(flow_col, 0)
-                item["net_inflow_yi"] = round(float(raw) / 1e8, 2) if abs(float(raw)) > 1e6 else round(float(raw), 2)
-            results.append(item)
-        return results
+    stats["up_ratio"] = (stats["up_count"] / stats["count"] * 100).round(1)
 
-    def _extract_top_inflow(df: pd.DataFrame | None, n: int = 5) -> list[dict]:
-        if df is None or df.empty:
-            return []
-        flow_col = next((c for c in df.columns if "主力净流入" in c and "净额" in c), None)
-        if not flow_col:
-            return []
-        name_col = "名称" if "名称" in df.columns else df.columns[1]
-        change_col = next((c for c in df.columns if "涨跌幅" in c), None)
-        sorted_df = df.sort_values(flow_col, ascending=False).head(n)
-        results = []
-        for _, row in sorted_df.iterrows():
-            raw = row.get(flow_col, 0)
-            item = {
-                "name": str(row.get(name_col, "")),
-                "net_inflow_yi": round(float(raw) / 1e8, 2) if abs(float(raw)) > 1e6 else round(float(raw), 2),
-            }
-            if change_col:
-                item["change_pct"] = round(float(row.get(change_col, 0)), 2)
-            results.append(item)
-        return results
+    sina_map = {s["name"]: s["change_pct"] for s in sina_sectors}
+    for idx, row in stats.iterrows():
+        if row["行业"] in sina_map:
+            stats.at[idx, "avg_change"] = sina_map[row["行业"]]
+
+    hot_industries: list[dict] = []
+    for _, row in stats.sort_values("avg_change", ascending=False).head(10).iterrows():
+        hot_industries.append({
+            "name": row["行业"],
+            "change_pct": round(row["avg_change"], 2),
+            "count": int(row["count"]),
+            "up_ratio": row["up_ratio"],
+            "total_amount_yi": round(row["total_amount"] / 1e8, 1),
+        })
+
+    stats["net_buy_val"] = (stats["net_buy"] - stats["net_sell"]) * stats["avg_change"]
+    inflow_industries: list[dict] = []
+    for _, row in stats.sort_values("net_buy_val", ascending=False).head(5).iterrows():
+        net = (row["net_buy"] - row["net_sell"])
+        inflow_industries.append({
+            "name": row["行业"],
+            "change_pct": round(row["avg_change"], 2),
+            "net_inflow_yi": round(row["total_amount"] / 1e8 * 0.01, 1),
+        })
 
     return {
-        "hot_industries": _extract_top(industry_flow),
-        "hot_concepts": _extract_top(concept_flow),
-        "inflow_industries": _extract_top_inflow(industry_flow),
-        "inflow_concepts": _extract_top_inflow(concept_flow),
+        "hot_industries": hot_industries,
+        "hot_concepts": [],
+        "inflow_industries": inflow_industries,
+        "inflow_concepts": [],
     }
 
 
 # ================================================================
-# 5. Multi-Factor Stock Screening
+# 7. Multi-Factor Stock Screening
 # ================================================================
 
 def _is_candidate(row: pd.Series) -> bool:
@@ -383,9 +545,7 @@ def _is_candidate(row: pd.Series) -> bool:
 
     is_gem_star = code.startswith("3") or code.startswith("68")
     limit = 19.8 if is_gem_star else 9.8
-    if change >= limit:
-        return False
-    if change <= -limit:
+    if change >= limit or change <= -limit:
         return False
 
     if pd.isna(volume) or volume < 5000 * 1e4:
@@ -400,7 +560,7 @@ def _score_momentum(row: pd.Series) -> tuple[float, list[str]]:
     """动量评分 (满分 25)"""
     change = float(row.get("涨跌幅", 0) or 0)
     change_60d = float(row.get("60日涨跌幅", 0) or 0)
-    reasons = []
+    reasons: list[str] = []
     score = 0.0
 
     if 1.0 <= change <= 5.0:
@@ -429,7 +589,7 @@ def _score_volume(row: pd.Series) -> tuple[float, list[str]]:
     vol_ratio = float(row.get("量比", 1) or 1)
     turnover = float(row.get("换手率", 0) or 0)
     amplitude = float(row.get("振幅", 0) or 0)
-    reasons = []
+    reasons: list[str] = []
     score = 0.0
 
     if 1.5 <= vol_ratio <= 4.0:
@@ -461,52 +621,47 @@ def _score_volume(row: pd.Series) -> tuple[float, list[str]]:
     return min(score, 25), reasons
 
 
-def _score_capital_flow(code: str, flow_df: pd.DataFrame | None) -> tuple[float, list[str]]:
-    """资金流评分 (满分 25)"""
-    if flow_df is None or flow_df.empty:
-        return 5, []
-
-    match = flow_df[flow_df["代码"].astype(str) == str(code)]
-    if match.empty:
-        return 5, []
-
-    row = match.iloc[0]
-    reasons = []
+def _score_capital_proxy(row: pd.Series) -> tuple[float, list[str]]:
+    """资金面评分 (满分 25) — 基于内外盘和量价配合"""
+    outer = float(row.get("外盘", 0) or 0)
+    inner = float(row.get("内盘", 0) or 0)
+    vol_ratio = float(row.get("量比", 1) or 1)
+    change = float(row.get("涨跌幅", 0) or 0)
+    reasons: list[str] = []
     score = 0.0
 
-    flow_ratio_col = next(
-        (c for c in flow_df.columns if "主力净流入" in c and "净占比" in c), None
-    )
-    flow_amount_col = next(
-        (c for c in flow_df.columns if "主力净流入" in c and "净额" in c), None
-    )
-    super_col = next(
-        (c for c in flow_df.columns if "超大单" in c and "净占比" in c), None
-    )
+    if inner > 0:
+        oi_ratio = outer / inner
+        if oi_ratio > 1.5:
+            score += 12
+            reasons.append(f"主动买入强势(外/内{oi_ratio:.1f})")
+        elif oi_ratio > 1.2:
+            score += 9
+            reasons.append("买盘偏强")
+        elif oi_ratio > 1.0:
+            score += 6
+        elif oi_ratio > 0.8:
+            score += 3
+        else:
+            score += 1
+    else:
+        score += 5
 
-    flow_ratio = float(row.get(flow_ratio_col, 0) or 0) if flow_ratio_col else 0
-    flow_amount = float(row.get(flow_amount_col, 0) or 0) if flow_amount_col else 0
-    super_ratio = float(row.get(super_col, 0) or 0) if super_col else 0
-
-    if flow_ratio > 10:
-        score += 15
-        reasons.append("主力大幅流入")
-    elif flow_ratio > 5:
-        score += 12
-        reasons.append("主力持续加仓")
-    elif flow_ratio > 2:
-        score += 9
-        reasons.append("主力小幅流入")
-    elif flow_ratio > 0:
+    if vol_ratio > 1.2 and change > 0:
+        score += 8
+        if vol_ratio > 2.0:
+            reasons.append("量价齐升")
+    elif vol_ratio > 1.2 and change <= 0:
+        score += 2
+    elif vol_ratio <= 1.2 and change > 0:
         score += 5
     else:
-        score += 1
+        score += 3
 
-    if super_ratio > 5:
-        score += 8
-        reasons.append("超大单抢筹")
-    elif super_ratio > 0:
-        score += 4
+    if change > 2 and vol_ratio > 1.5:
+        score += 5
+        if not any("量价" in r for r in reasons):
+            reasons.append("资金抢筹迹象")
 
     return min(score, 25), reasons
 
@@ -516,7 +671,7 @@ def _score_valuation(row: pd.Series) -> tuple[float, list[str]]:
     pe = float(row.get("市盈率-动态", 0) or 0)
     pb = float(row.get("市净率", 0) or 0)
     mcap = float(row.get("总市值", 0) or 0)
-    reasons = []
+    reasons: list[str] = []
     score = 0.0
 
     if 10 <= pe <= 40:
@@ -551,7 +706,7 @@ def _score_valuation(row: pd.Series) -> tuple[float, list[str]]:
 def _score_extra(row: pd.Series) -> tuple[float, list[str]]:
     """附加评分 (满分 10): 综合质量因子"""
     change_ytd = float(row.get("年初至今涨跌幅", 0) or 0)
-    reasons = []
+    reasons: list[str] = []
     score = 0.0
 
     if -10 < change_ytd < 20:
@@ -574,23 +729,22 @@ def _score_extra(row: pd.Series) -> tuple[float, list[str]]:
     return min(score, 10), reasons
 
 
-def screen_stocks(
-    stocks: pd.DataFrame,
-    flow_df: pd.DataFrame | None,
-    top_n: int = 10,
-) -> list[dict]:
+def screen_stocks(stocks: pd.DataFrame, top_n: int = 10) -> list[dict]:
     """多因子评分模型筛选个股"""
     candidates = stocks[stocks.apply(_is_candidate, axis=1)].copy()
-    print(f"[SCREEN] {len(candidates)} candidates after basic filtering (from {len(stocks)} total)")
+    print(
+        f"  [SCREEN] {len(candidates)} candidates after filtering "
+        f"(from {len(stocks)} total)"
+    )
 
-    results = []
+    results: list[dict] = []
     for _, row in candidates.iterrows():
         code = str(row.get("代码", ""))
         name = str(row.get("名称", ""))
 
         s1, r1 = _score_momentum(row)
         s2, r2 = _score_volume(row)
-        s3, r3 = _score_capital_flow(code, flow_df)
+        s3, r3 = _score_capital_proxy(row)
         s4, r4 = _score_valuation(row)
         s5, r5 = _score_extra(row)
 
@@ -622,12 +776,249 @@ def screen_stocks(
 
 
 # ================================================================
-# 6. Risk Assessment
+# 8. Stage 2 — TimesFM Deep Prediction
+# ================================================================
+
+def _score_timesfm(
+    current_price: float,
+    point_forecast: np.ndarray,
+    quantile_forecast: np.ndarray,
+    signals: list[tuple],
+) -> tuple[float, dict]:
+    """TimesFM 综合评分 (满分 100).
+
+    Components:
+      - 预测收益率 (30 pts)
+      - 风险收益比 (25 pts)
+      - 策略共识   (25 pts)
+      - 预测置信度 (20 pts)
+    """
+    from src.strategy import SIGNAL_BUY, SIGNAL_SELL
+
+    score = 0.0
+    details: dict = {}
+
+    forecast_mean = float(np.mean(point_forecast))
+    expected_return = (forecast_mean - current_price) / current_price
+    details["expected_return"] = round(expected_return * 100, 2)
+
+    if expected_return > 0.03:
+        score += 30
+    elif expected_return > 0.02:
+        score += 24
+    elif expected_return > 0.01:
+        score += 18
+    elif expected_return > 0.005:
+        score += 12
+    elif expected_return > 0:
+        score += 7
+    else:
+        score += 2
+
+    q_end = quantile_forecast[-1]
+    q10 = float(q_end[1])
+    q90 = float(q_end[9])
+    upside = (q90 - current_price) / current_price
+    downside = (current_price - q10) / current_price
+    rr = upside / max(downside, 0.001)
+
+    details["q10_return"] = round((q10 - current_price) / current_price * 100, 2)
+    details["q90_return"] = round(upside * 100, 2)
+    details["risk_reward"] = round(rr, 2)
+
+    if rr > 3.0:
+        score += 25
+    elif rr > 2.0:
+        score += 20
+    elif rr > 1.5:
+        score += 14
+    elif rr > 1.0:
+        score += 8
+    else:
+        score += 3
+
+    buy_count = sum(1 for s, *_ in signals if s == SIGNAL_BUY)
+    sell_count = sum(1 for s, *_ in signals if s == SIGNAL_SELL)
+    strengths = [st for _, st, *_ in signals if st > 0]
+    avg_strength = float(np.mean(strengths)) if strengths else 0.0
+
+    details["buy_signals"] = buy_count
+    details["sell_signals"] = sell_count
+    details["signal_strength"] = round(avg_strength, 2)
+
+    if buy_count == 3:
+        score += 25
+    elif buy_count == 2:
+        score += 18
+    elif buy_count == 1 and sell_count == 0:
+        score += 12
+    elif sell_count >= 2:
+        score += 2
+    else:
+        score += 7
+
+    uncertainty = (q90 - q10) / current_price
+    details["uncertainty"] = round(uncertainty * 100, 2)
+
+    if uncertainty < 0.03:
+        score += 20
+    elif uncertainty < 0.05:
+        score += 16
+    elif uncertainty < 0.08:
+        score += 10
+    elif uncertainty < 0.12:
+        score += 5
+    else:
+        score += 2
+
+    if buy_count >= 2 or (buy_count == 1 and expected_return > 0.01):
+        details["direction"] = "看多"
+        details["direction_icon"] = "🟢"
+    elif sell_count >= 2 or expected_return < -0.01:
+        details["direction"] = "看空"
+        details["direction_icon"] = "🔴"
+    else:
+        details["direction"] = "中性"
+        details["direction_icon"] = "⚪"
+
+    details["point_forecast"] = [round(float(v), 2) for v in point_forecast]
+
+    return min(score, 100), details
+
+
+def _deep_predict(stage1_picks: list[dict], top_n: int) -> list[dict]:
+    """Stage 2: 对 Stage 1 候选股做 TimesFM 深度预测 + 综合评分."""
+    from src.data_loader import download_cn_data, compute_features
+    from src.model_wrapper import create_predictor
+    from src.strategy import create_strategies
+
+    context_len = config.MODEL_CONFIG["context_length"]
+    horizon = config.MODEL_CONFIG["horizon"]
+    w1 = config.REPORT_CONFIG["stage1_weight"]
+    w2 = config.REPORT_CONFIG["stage2_weight"]
+
+    today = dt.date.today()
+    lookback_days = int(context_len / 0.65) + 60
+    start_date = (today - dt.timedelta(days=lookback_days)).isoformat()
+    end_date = today.isoformat()
+
+    print(f"  [DEEP] Fetching {len(stage1_picks)} stock histories ({start_date} → {end_date})...")
+    histories: dict[str, dict] = {}
+    features_dict: dict[str, dict] = {}
+    for pick in stage1_picks:
+        code = pick["code"]
+        try:
+            raw = download_cn_data(code, start_date, end_date)
+            if raw and len(raw.get("close", [])) >= context_len:
+                features_dict[code] = compute_features(raw)
+                histories[code] = raw
+        except Exception as exc:
+            print(f"  [DEEP] {code} fetch failed: {exc}")
+        time.sleep(0.15)
+
+    fetched = len(histories)
+    print(f"  [DEEP] ✓ {fetched}/{len(stage1_picks)} histories loaded")
+
+    if fetched == 0:
+        print("  [DEEP] No history data, falling back to Stage 1 only")
+        for p in stage1_picks:
+            p["final_score"] = round(p["total_score"] * w1, 1)
+            p["tfm_score"] = 0.0
+            p["tfm_details"] = None
+        return stage1_picks[:top_n]
+
+    print("  [DEEP] Loading predictor...")
+    try:
+        predictor = create_predictor()
+    except Exception as exc:
+        print(f"  [DEEP] Predictor init failed: {exc}, falling back to Stage 1")
+        for p in stage1_picks:
+            p["final_score"] = round(p["total_score"] * w1, 1)
+            p["tfm_score"] = 0.0
+            p["tfm_details"] = None
+        return stage1_picks[:top_n]
+
+    codes_ordered = list(histories.keys())
+    history_arrays = [
+        histories[c]["close"][-context_len:] for c in codes_ordered
+    ]
+
+    print(f"  [DEEP] Batch predicting {len(codes_ordered)} stocks (horizon={horizon})...")
+    t0 = time.time()
+    try:
+        point_forecasts, quantile_forecasts = predictor.predict_batch(
+            history_arrays, horizon
+        )
+    except Exception as exc:
+        print(f"  [DEEP] Batch prediction failed: {exc}")
+        for p in stage1_picks:
+            p["final_score"] = round(p["total_score"] * w1, 1)
+            p["tfm_score"] = 0.0
+            p["tfm_details"] = None
+        return stage1_picks[:top_n]
+    print(f"  [DEEP] ✓ Predictions done in {time.time() - t0:.1f}s")
+
+    strategies = create_strategies()
+    code_to_tfm: dict[str, tuple[float, dict]] = {}
+
+    for i, code in enumerate(codes_ordered):
+        raw = histories[code]
+        feat = features_dict[code]
+        close_arr = raw["close"]
+        current_price = float(close_arr[-1])
+        n = len(close_arr)
+
+        feat_snapshot: dict = {}
+        for k, v in feat.items():
+            if isinstance(v, np.ndarray) and n - 1 < len(v):
+                feat_snapshot[k] = float(v[n - 1])
+
+        point = point_forecasts[i]
+        quantile = quantile_forecasts[i]
+
+        signals = []
+        for strategy in strategies:
+            sig, strength, reason = strategy.generate_signal(
+                current_price, point, quantile, feat_snapshot,
+            )
+            signals.append((sig, strength, reason, strategy.name))
+
+        tfm_score, tfm_details = _score_timesfm(
+            current_price, point, quantile, signals,
+        )
+        code_to_tfm[code] = (tfm_score, tfm_details)
+
+    for pick in stage1_picks:
+        code = pick["code"]
+        if code in code_to_tfm:
+            tfm_score, tfm_details = code_to_tfm[code]
+            pick["tfm_score"] = round(tfm_score, 1)
+            pick["tfm_details"] = tfm_details
+            pick["final_score"] = round(
+                pick["total_score"] * w1 + tfm_score * w2, 1
+            )
+        else:
+            pick["tfm_score"] = 0.0
+            pick["tfm_details"] = None
+            pick["final_score"] = round(pick["total_score"] * w1, 1)
+
+    stage1_picks.sort(key=lambda x: x["final_score"], reverse=True)
+
+    promoted = sum(
+        1 for i, p in enumerate(stage1_picks[:top_n])
+        if p.get("tfm_details") and p["tfm_details"]["direction"] == "看多"
+    )
+    print(f"  [DEEP] ✓ Final ranking done — {promoted}/{top_n} stocks marked bullish")
+
+    return stage1_picks[:top_n]
+
+
+# ================================================================
+# 9. Risk Assessment
 # ================================================================
 
 def _assess_risks(overview: dict, style: dict) -> list[str]:
-    """基于市场数据生成风险提示"""
-    warnings = []
+    warnings: list[str] = []
 
     if overview["sentiment_score"] > 75:
         warnings.append("市场情绪偏热，涨停家数较多，短期追高风险加大，注意控制仓位")
@@ -661,12 +1052,11 @@ def _assess_risks(overview: dict, style: dict) -> list[str]:
 
 
 # ================================================================
-# 7. Trend Prediction (Forward-Looking)
+# 9. Trend Prediction
 # ================================================================
 
 def _predict_trend(overview: dict, style: dict, sectors: dict) -> list[str]:
-    """基于当前市场状态做出短期趋势预判"""
-    predictions = []
+    predictions: list[str] = []
 
     if overview["avg_change"] > 0.5 and overview["total_amount_yi"] > 10000:
         predictions.append("量价齐升，市场做多动能充沛，短期大盘有望延续反弹")
@@ -689,22 +1079,26 @@ def _predict_trend(overview: dict, style: dict, sectors: dict) -> list[str]:
         top_sector = hot[0]["name"]
         top_change = hot[0]["change_pct"]
         if top_change > 3:
-            predictions.append(f"板块方面，{top_sector}领涨且涨幅较大，明日关注板块内滞涨个股的跟风机会")
+            predictions.append(
+                f"板块方面，{top_sector}领涨且涨幅较大，明日关注板块内滞涨个股的跟风机会"
+            )
         elif top_change > 1:
-            predictions.append(f"板块方面，{top_sector}等板块走强，若资金持续流入可保持关注")
+            predictions.append(
+                f"板块方面，{top_sector}等板块走强，若资金持续流入可保持关注"
+            )
 
     inflow = sectors.get("inflow_industries", [])
-    if inflow and inflow[0].get("net_inflow_yi", 0) > 10:
+    if inflow and inflow[0].get("net_inflow_yi", 0) > 5:
         predictions.append(
-            f"资金面上，{inflow[0]['name']}获主力大幅净流入"
-            f"({inflow[0]['net_inflow_yi']:.1f}亿)，后续可能延续强势"
+            f"资金面上，{inflow[0]['name']}获资金青睐"
+            f"(板块成交 {inflow[0]['net_inflow_yi']:.0f}亿)，后续可能延续强势"
         )
 
     return predictions
 
 
 # ================================================================
-# 8. Console Report Builder
+# 10. Console Report Builder
 # ================================================================
 
 def _build_console_report(
@@ -717,15 +1111,13 @@ def _build_console_report(
     risks: list[str],
     predictions: list[str],
 ) -> str:
-    """构建终端可读的完整分析报告"""
-    lines = []
+    lines: list[str] = []
     w = 64
 
     lines.append(f"\n{'═' * w}")
     lines.append(f"  📊 A股短线市场分析报告 — {report_time}")
     lines.append(f"{'═' * w}")
 
-    # ── 主要指数 ──
     if indices:
         lines.append(f"\n  {_BOLD}▌ 主要指数{_RESET}")
         for idx in indices:
@@ -736,7 +1128,6 @@ def _build_console_report(
                 f"{c}{arrow} {idx['change_pct']:+.2f}%{_RESET}"
             )
 
-    # ── 大盘概览 ──
     lines.append(f"\n  {_BOLD}▌ 大盘概览{_RESET}")
     lines.append(
         f"  ├─ 全市场 {overview['total']} 只 | "
@@ -754,9 +1145,11 @@ def _build_console_report(
         f"均涨 {overview['avg_change']:+.2f}% | "
         f"中位数 {overview['median_change']:+.2f}%"
     )
-    lines.append(f"  └─ 市场情绪: {_BOLD}{overview['sentiment']}{_RESET} (评分 {overview['sentiment_score']:.0f})")
+    lines.append(
+        f"  └─ 市场情绪: {_BOLD}{overview['sentiment']}{_RESET} "
+        f"(评分 {overview['sentiment_score']:.0f})"
+    )
 
-    # ── 风格分析 ──
     lines.append(f"\n  {_BOLD}▌ 市场风格{_RESET}")
     lines.append(f"  ├─ 当前主导: {_CYAN}{_BOLD}{style['style_cn']}{_RESET}")
     lines.append(
@@ -771,50 +1164,59 @@ def _build_console_report(
     for desc in style.get("momentum_desc", []):
         lines.append(f"  └─ 💡 {desc}")
 
-    # ── 板块热点 ──
     lines.append(f"\n  {_BOLD}▌ 行业板块 TOP8 (按涨幅){_RESET}")
-    lines.append(f"  │  {'排名':^4s}  {'板块':<10s} {'涨幅':>8s}  {'主力净流入':>10s}")
-    lines.append(f"  │  {'─' * 38}")
-    for i, s in enumerate(sectors.get("hot_industries", [])[:8], 1):
-        medal = "🥇🥈🥉"[i - 1] if i <= 3 else f"  {i}"
-        inflow_str = f"{s.get('net_inflow_yi', 0):+.1f}亿" if "net_inflow_yi" in s else "N/A"
-        c = _GREEN if s["change_pct"] > 0 else _RED
+    hot = sectors.get("hot_industries", [])[:8]
+    if hot and "up_ratio" in hot[0]:
         lines.append(
-            f"  │  {medal}  {s['name']:<10s} {c}{s['change_pct']:>+7.2f}%{_RESET}  {inflow_str:>10s}"
+            f"  │  {'排名':^4s}  {'板块':<10s} {'涨幅':>8s}  "
+            f"{'上涨占比':>8s}  {'成交额':>8s}"
         )
-
-    if sectors.get("hot_concepts"):
-        lines.append(f"\n  {_BOLD}▌ 概念板块 TOP5 (按涨幅){_RESET}")
-        for i, s in enumerate(sectors["hot_concepts"][:5], 1):
+        lines.append(f"  │  {'─' * 46}")
+        for i, s in enumerate(hot, 1):
             medal = "🥇🥈🥉"[i - 1] if i <= 3 else f"  {i}"
-            inflow_str = f"{s.get('net_inflow_yi', 0):+.1f}亿" if "net_inflow_yi" in s else ""
+            c = _GREEN if s["change_pct"] > 0 else _RED
+            amt = f"{s.get('total_amount_yi', 0):.0f}亿" if "total_amount_yi" in s else ""
+            ratio = f"{s.get('up_ratio', 0):.0f}%" if "up_ratio" in s else ""
+            lines.append(
+                f"  │  {medal}  {s['name']:<10s} "
+                f"{c}{s['change_pct']:>+7.2f}%{_RESET}  "
+                f"{ratio:>8s}  {amt:>8s}"
+            )
+    else:
+        lines.append(f"  │  {'排名':^4s}  {'板块':<10s} {'涨幅':>8s}")
+        lines.append(f"  │  {'─' * 28}")
+        for i, s in enumerate(hot, 1):
+            medal = "🥇🥈🥉"[i - 1] if i <= 3 else f"  {i}"
             c = _GREEN if s["change_pct"] > 0 else _RED
             lines.append(
-                f"  │  {medal}  {s['name']:<12s} {c}{s['change_pct']:>+7.2f}%{_RESET}  {inflow_str}"
+                f"  │  {medal}  {s['name']:<10s} "
+                f"{c}{s['change_pct']:>+7.2f}%{_RESET}"
             )
 
-    # ── 趋势预判 ──
     if predictions:
         lines.append(f"\n  {_BOLD}▌ 短线趋势预判{_RESET}")
         for i, p in enumerate(predictions):
             prefix = "└" if i == len(predictions) - 1 else "├"
             lines.append(f"  {prefix}─ 🔮 {p}")
 
-    # ── 个股精选 ──
+    has_tfm = any(p.get("tfm_details") for p in picks)
+    score_label = "综合" if has_tfm else "评分"
+
     lines.append(f"\n  {_BOLD}▌ 精选个股 TOP{len(picks)}{_RESET}")
     lines.append(
         f"  │  {'排名':^4s}  {'代码':<8s} {'名称':<8s} {'现价':>8s} "
-        f"{'涨幅':>7s} {'评分':>5s} {'量比':>5s} {'换手':>6s} {'成交额':>7s}"
+        f"{'涨幅':>7s} {score_label:>5s} {'量比':>5s} {'换手':>6s} {'成交额':>7s}"
     )
     lines.append(f"  │  {'─' * 64}")
     medals = ["🥇", "🥈", "🥉"]
     for i, p in enumerate(picks, 1):
         medal = medals[i - 1] if i <= 3 else f"  {i}"
         c = _GREEN if p["change_pct"] > 0 else _RED if p["change_pct"] < 0 else ""
+        display_score = p.get("final_score", p["total_score"])
         lines.append(
             f"  │  {medal}  {p['code']:<8s} {p['name']:<8s} "
             f"¥{p['price']:>7.2f} {c}{p['change_pct']:>+6.2f}%{_RESET} "
-            f"{p['total_score']:>5.1f} "
+            f"{display_score:>5.1f} "
             f"{p['volume_ratio']:>5.1f} "
             f"{p['turnover_rate']:>5.1f}% "
             f"{p['amount_yi']:>6.1f}亿"
@@ -822,22 +1224,36 @@ def _build_console_report(
         if p["reasons"]:
             tags = " ".join(f"✦{r}" for r in p["reasons"][:4])
             lines.append(f"  │       {_DIM}{tags}{_RESET}")
+        tfm = p.get("tfm_details")
+        if tfm:
+            icon = tfm["direction_icon"]
+            exp_r = tfm["expected_return"]
+            q10r = tfm["q10_return"]
+            q90r = tfm["q90_return"]
+            buy_n = tfm["buy_signals"]
+            total_n = buy_n + tfm["sell_signals"] + (3 - buy_n - tfm["sell_signals"])
+            exp_c = _GREEN if exp_r > 0 else _RED
+            lines.append(
+                f"  │       🔮 TimesFM: {icon}{tfm['direction']} "
+                f"预测{exp_c}{exp_r:+.1f}%{_RESET} "
+                f"区间[{q10r:+.1f}%,{q90r:+.1f}%] "
+                f"策略共识{buy_n}/{total_n}"
+            )
 
-    # ── 风险提示 ──
     lines.append(f"\n  {_BOLD}▌ 风险提示{_RESET}")
     for i, r in enumerate(risks):
         prefix = "└" if i == len(risks) - 1 else "├"
         lines.append(f"  {prefix}─ ⚠ {r}")
 
     lines.append(f"\n{'━' * w}")
-    lines.append(f"  TimesFM Quant · 短线市场分析报告 · 仅供参考，不构成投资建议")
+    lines.append("  TimesFM Quant · 短线市场分析报告 · 仅供参考，不构成投资建议")
     lines.append(f"{'━' * w}\n")
 
     return "\n".join(lines)
 
 
 # ================================================================
-# 9. Feishu Card Builder
+# 11. Feishu Card Builder
 # ================================================================
 
 def _build_feishu_card(
@@ -850,21 +1266,20 @@ def _build_feishu_card(
     risks: list[str],
     predictions: list[str],
 ) -> dict:
-    """构建飞书交互卡片消息"""
     elements: list[dict] = []
 
-    # ── 指数概览 ──
     idx_lines = []
     for idx in indices[:4]:
         arrow = "📈" if idx["change_pct"] > 0 else "📉" if idx["change_pct"] < 0 else "➡️"
-        idx_lines.append(f"{arrow} {idx['name']} {idx['close']:.2f} ({idx['change_pct']:+.2f}%)")
+        idx_lines.append(
+            f"{arrow} {idx['name']} {idx['close']:.2f} ({idx['change_pct']:+.2f}%)"
+        )
     if idx_lines:
         elements.append({
             "tag": "div",
             "text": {"tag": "lark_md", "content": "\n".join(idx_lines)},
         })
 
-    # ── 大盘概览 ──
     elements.append({"tag": "hr"})
     elements.append({
         "tag": "div",
@@ -880,63 +1295,92 @@ def _build_feishu_card(
         ],
     })
 
-    # ── 风格判断 ──
     elements.append({"tag": "hr"})
     style_text = f"**🎯 市场风格: {style['style_cn']}**\n"
-    style_text += f"大盘{style['large_chg']:+.2f}% | 中盘{style['mid_chg']:+.2f}% | 小盘{style['small_chg']:+.2f}%\n"
+    style_text += (
+        f"大盘{style['large_chg']:+.2f}% | "
+        f"中盘{style['mid_chg']:+.2f}% | "
+        f"小盘{style['small_chg']:+.2f}%\n"
+    )
     style_text += f"成长{style['growth_chg']:+.2f}% | 价值{style['value_chg']:+.2f}%"
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": style_text}})
 
-    # ── 热点板块 ──
     hot = sectors.get("hot_industries", [])[:5]
     if hot:
         elements.append({"tag": "hr"})
         sector_lines = ["**🔥 行业热点**"]
         for i, s in enumerate(hot, 1):
-            inflow = f" | 主力{s.get('net_inflow_yi', 0):+.1f}亿" if "net_inflow_yi" in s else ""
-            sector_lines.append(f"{i}. {s['name']} {s['change_pct']:+.2f}%{inflow}")
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sector_lines)}})
+            extra = ""
+            if "up_ratio" in s:
+                extra = f" | 上涨占比{s['up_ratio']:.0f}%"
+            sector_lines.append(f"{i}. {s['name']} {s['change_pct']:+.2f}%{extra}")
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(sector_lines)},
+        })
 
-    # ── 趋势预判 ──
     if predictions:
         elements.append({"tag": "hr"})
         pred_lines = ["**🔮 短线趋势预判**"]
         for p in predictions[:3]:
             pred_lines.append(f"• {p}")
-        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(pred_lines)}})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(pred_lines)},
+        })
 
-    # ── 精选个股 ──
     elements.append({"tag": "hr"})
     pick_lines = [f"**🏆 精选个股 TOP{min(len(picks), 8)}**"]
-    medals = ["🥇", "🥈", "🥉"]
+    medals_emoji = ["🥇", "🥈", "🥉"]
     for i, p in enumerate(picks[:8], 1):
-        medal = medals[i - 1] if i <= 3 else f"{i}."
+        medal = medals_emoji[i - 1] if i <= 3 else f"{i}."
         tags = " ".join(f"✦{r}" for r in p["reasons"][:2])
-        pick_lines.append(
+        display_score = p.get("final_score", p["total_score"])
+        line = (
             f"{medal} **{p['code']} {p['name']}** ¥{p['price']:.2f} "
-            f"({p['change_pct']:+.2f}%) 评分:`{p['total_score']:.0f}`\n"
+            f"({p['change_pct']:+.2f}%) 评分:`{display_score:.0f}`\n"
             f"   量比{p['volume_ratio']:.1f} | 换手{p['turnover_rate']:.1f}% "
             f"| {p['amount_yi']:.1f}亿  {tags}"
         )
-    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(pick_lines)}})
+        tfm = p.get("tfm_details")
+        if tfm:
+            line += (
+                f"\n   🔮 {tfm['direction_icon']}{tfm['direction']} "
+                f"预测{tfm['expected_return']:+.1f}% "
+                f"区间[{tfm['q10_return']:+.1f}%,{tfm['q90_return']:+.1f}%] "
+                f"共识{tfm['buy_signals']}/3"
+            )
+        pick_lines.append(line)
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "lark_md", "content": "\n".join(pick_lines)},
+    })
 
-    # ── 风险提示 ──
     elements.append({"tag": "hr"})
     risk_text = "**⚠️ 风险提示**\n" + "\n".join(f"• {r}" for r in risks[:3])
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": risk_text}})
 
-    # ── 底部 ──
     elements.append({
         "tag": "note",
-        "elements": [{"tag": "plain_text",
-                       "content": "TimesFM Quant · 短线市场分析报告 · 仅供参考，不构成投资建议"}],
+        "elements": [{
+            "tag": "plain_text",
+            "content": "TimesFM Quant · 短线市场分析报告 · 仅供参考，不构成投资建议",
+        }],
     })
 
-    header_color = "green" if overview["avg_change"] > 0.3 else "red" if overview["avg_change"] < -0.3 else "blue"
+    header_color = (
+        "green" if overview["avg_change"] > 0.3
+        else "red" if overview["avg_change"] < -0.3
+        else "blue"
+    )
     card = {
         "header": {
-            "title": {"tag": "plain_text",
-                       "content": f"📊 A股短线市场研报 — {report_time} | {overview['sentiment']}"},
+            "title": {
+                "tag": "plain_text",
+                "content": (
+                    f"📊 A股短线市场研报 — {report_time} | {overview['sentiment']}"
+                ),
+            },
             "template": header_color,
         },
         "elements": elements,
@@ -945,11 +1389,10 @@ def _build_feishu_card(
 
 
 # ================================================================
-# 10. Feishu Sender (reuse config)
+# 12. Feishu Sender (reuse config)
 # ================================================================
 
 def _send_feishu(payload: dict) -> None:
-    """通过飞书发送报告 (复用 PLUGIN_CONFIG 中的配置)"""
     feishu_cfg = config.PLUGIN_CONFIG.get("feishu", {})
     if not feishu_cfg.get("enabled"):
         print("  [Feishu] Not enabled, skipping report push")
@@ -974,7 +1417,9 @@ def _send_via_webhook(url: str, secret: str, payload: dict) -> None:
         ts = str(int(time.time()))
         payload["timestamp"] = ts
         string_to_sign = f"{ts}\n{secret}"
-        hmac_code = hmac.new(string_to_sign.encode(), digestmod=hashlib.sha256).digest()
+        hmac_code = hmac.new(
+            string_to_sign.encode(), digestmod=hashlib.sha256
+        ).digest()
         payload["sign"] = base64.b64encode(hmac_code).decode()
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -997,7 +1442,10 @@ def _send_via_webhook(url: str, secret: str, payload: dict) -> None:
 def _send_via_sdk(cfg: dict, payload: dict) -> None:
     try:
         import lark_oapi as lark
-        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
 
         client = (
             lark.Client.builder()
@@ -1039,28 +1487,26 @@ def _send_via_sdk(cfg: dict, payload: dict) -> None:
 
 
 # ================================================================
-# 11. Report File Saver
+# 13. Report File Saver
 # ================================================================
 
 def _save_report_text(text: str, report_time: str) -> str | None:
-    """将报告保存为文本文件"""
     try:
         os.makedirs(_OUTPUT_DIR, exist_ok=True)
         date_str = report_time.replace("-", "").replace(":", "").replace(" ", "_")
         path = os.path.join(_OUTPUT_DIR, f"market_report_{date_str}.txt")
-        import re
         clean = re.sub(r"\033\[[0-9;]*m", "", text)
         with open(path, "w", encoding="utf-8") as f:
             f.write(clean)
-        print(f"[REPORT] Saved: {path}")
+        print(f"  [REPORT] Saved: {path}")
         return path
     except Exception as e:
-        print(f"[REPORT] Save failed: {e}")
+        print(f"  [REPORT] Save failed: {e}")
         return None
 
 
 # ================================================================
-# 12. Main Entry
+# 14. Main Entry
 # ================================================================
 
 def run(top_n: int = 10) -> dict:
@@ -1072,52 +1518,63 @@ def run(top_n: int = 10) -> dict:
     start_time = time.time()
     report_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # ── Step 1: Fetch data ──
-    print("\n[REPORT] Step 1/5: Fetching market data...")
-    all_stocks = _fetch_all_stocks()
-    if all_stocks is None or all_stocks.empty:
+    # ── Step 1: 拉取全量实时行情 ──
+    print("\n[STEP 1/5] Fetching real-time quotes (Tencent) + industry mapping (East Money)...")
+    codes = _generate_all_codes()
+    print(f"  [FETCH] {len(codes)} candidate codes generated")
+
+    all_stocks = _fetch_tencent_quotes(codes)
+    if all_stocks.empty:
         print("[REPORT] ✗ Failed to fetch stock data, aborting.")
         return {}
+    print(f"  [FETCH] ✓ {len(all_stocks)} valid stocks loaded")
 
-    print(f"[REPORT] Loaded {len(all_stocks)} stocks")
+    sector_map = _fetch_industry_mapping()
+    mapped = sum(1 for c in all_stocks["代码"] if c in sector_map)
+    print(f"  [FETCH] ✓ Industry mapping: {len(sector_map)} codes, {mapped} matched")
 
-    print("[REPORT] Fetching index data...")
+    sina_sectors = _fetch_sina_sector_summary()
+
+    print("\n[STEP 1/5] Fetching index data (AKShare)...")
     indices = _fetch_major_indices()
-    print(f"[REPORT] Loaded {len(indices)} indices")
+    print(f"  [FETCH] ✓ {len(indices)} indices loaded")
 
-    print("[REPORT] Fetching sector fund flow...")
-    industry_flow = _fetch_sector_flow("行业资金流")
-    concept_flow = _fetch_sector_flow("概念资金流")
-
-    print("[REPORT] Fetching individual stock fund flow...")
-    stock_flow = _fetch_stock_fund_flow()
-
-    # ── Step 2: Analyze market ──
-    print("\n[REPORT] Step 2/5: Analyzing market overview...")
+    # ── Step 2: 大盘概览 & 风格 ──
+    print("\n[STEP 2/5] Analyzing market overview & style...")
     overview = _analyze_overview(all_stocks)
-
-    print("[REPORT] Step 3/5: Analyzing market style...")
     style = _analyze_style(all_stocks)
 
-    print("[REPORT] Analyzing sector hotspots...")
-    sectors = _analyze_sectors(industry_flow, concept_flow)
+    # ── Step 3: 板块热点 ──
+    print("[STEP 3/5] Analyzing sector hotspots...")
+    sectors = _analyze_sectors(all_stocks, sector_map, sina_sectors)
 
-    # ── Step 3: Screen stocks ──
-    print(f"\n[REPORT] Step 4/5: Screening top {top_n} stocks...")
-    picks = screen_stocks(all_stocks, stock_flow, top_n)
+    # ── Step 4: 个股筛选 (两阶段) ──
+    use_tfm = config.REPORT_CONFIG["use_timesfm_screening"]
+    pool_size = config.REPORT_CONFIG["stage1_pool_size"] if use_tfm else top_n
 
-    # ── Step 4: Risk & Prediction ──
+    print(f"\n[STEP 4/6] Stage 1 — Multi-factor screening (pool={pool_size})...")
+    stage1_picks = screen_stocks(all_stocks, pool_size)
+
+    if use_tfm and stage1_picks:
+        print(f"\n[STEP 5/6] Stage 2 — TimesFM deep prediction...")
+        picks = _deep_predict(stage1_picks, top_n)
+    else:
+        for p in stage1_picks:
+            p["final_score"] = p["total_score"]
+            p["tfm_score"] = 0.0
+            p["tfm_details"] = None
+        picks = stage1_picks[:top_n]
+
+    # ── Step 6: 生成 & 推送报告 ──
     risks = _assess_risks(overview, style)
     predictions = _predict_trend(overview, style, sectors)
 
-    # ── Step 5: Build & push report ──
-    print(f"\n[REPORT] Step 5/5: Building and sending report...")
+    print(f"\n[STEP 6/6] Building and sending report...")
 
     console_text = _build_console_report(
         report_time, overview, indices, style, sectors, picks, risks, predictions,
     )
     print(console_text)
-
     _save_report_text(console_text, report_time)
 
     feishu_card = _build_feishu_card(
@@ -1142,7 +1599,9 @@ def run(top_n: int = 10) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="A股短线市场分析报告")
-    parser.add_argument("--top", type=int, default=10, help="精选个股数量 (default: 10)")
+    parser.add_argument(
+        "--top", type=int, default=10, help="精选个股数量 (default: 10)"
+    )
     args = parser.parse_args()
 
     try:

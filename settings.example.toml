@@ -94,6 +94,13 @@ receive_id = ""                     # 接收方 (邮箱/open_id/user_id/chat_id)
 receive_id_type = "email"           # 接收方类型: email / open_id / user_id / chat_id
 use_card = true                     # true=卡片消息 false=纯文本
 
+# ── 市场报告配置 ──────────────────────────────────────────────
+[report]
+use_timesfm_screening = true        # 是否启用 TimesFM 深度预测筛选
+stage1_pool_size = 50               # Stage 1 粗筛进入 Stage 2 的候选数量
+stage2_weight = 0.6                 # TimesFM 预测评分权重 (0-1)
+stage1_weight = 0.4                 # 多因子评分权重 (0-1)
+
 # ── 信号配置 ──────────────────────────────────────────────────
 [signal]
 actionable_only = false             # true 时只分发 BUY/SELL
